@@ -50,6 +50,7 @@ class Operations:
         # print(attrs)
         # print()
         # try:
+        print(">>> op: ", 'op_' + op_type.lower(), attrs, [i.shape for i in inputs])
         return getattr(self, 'op_' + op_type.lower())(*inputs, **attrs)
         # except Exception as e:
         #     print(">>> ", e, op_type, attrs, [i.shape for i in inputs])
@@ -145,7 +146,7 @@ class TfKerasOperations(Operations):
         if len(kernel_shape) == 2:
             x = ensure_data_format(x, InterleavedImageBatch)
             assert kernel_shape == weights.shape[2:4]
-            if group == 1:
+            if group != x.shape[3]:
                 # Tf; filter_height, filter_width, in_channels, out_channels
                 weights = weights.transpose(2, 3, 1, 0)
                 filters = weights.shape[3]
@@ -155,7 +156,7 @@ class TfKerasOperations(Operations):
                 weights = weights.transpose(2, 3, 0, 1)
                 filters = weights.shape[2]
                 def ConvClass(filters, kernel_size, strides, dilation_rate, padding,
-                              kernel_initializer, use_bias=True, bias_initializer='zeros'):
+                              kernel_initializer, use_bias=True, bias_initializer='zeros', groups=1):
                     return self.keras.layers.DepthwiseConv2D(kernel_size, strides, dilation_rate=dilation_rate,
                                                              padding=padding, use_bias=use_bias,
                                                              bias_initializer=bias_initializer,
@@ -179,14 +180,14 @@ class TfKerasOperations(Operations):
             if bias is None:
                 conv = ConvClass(filters, kernel_shape, strides,
                                  dilation_rate=dilations, padding=padding,
-                                 kernel_initializer='zeros', use_bias=False)
+                                 kernel_initializer='zeros', use_bias=False, groups=group)
                 out = conv(x)
                 conv.set_weights([weights.view(np.ndarray)])
             else:
                 bias = ensure_data_format(bias, OnnxConstant)  # XXX Assumes no ops on weights
                 conv = ConvClass(filters, kernel_shape, strides,
                                  dilation_rate=dilations, padding=padding,
-                                 kernel_initializer='zeros', bias_initializer='zeros')
+                                 kernel_initializer='zeros', bias_initializer='zeros', groups=group)
                 out = conv(x)
                 conv.set_weights([weights.view(np.ndarray), bias.view(np.ndarray)])
             out.data_format = InterleavedImageBatch
@@ -246,7 +247,7 @@ class TfKerasOperations(Operations):
             raise NotImplementedError
 
     def op_concat(self, *tensors, axis):
-        # print(">>> concat: ", [i.shape for i in tensors])
+        print(">>> concat: ", [i.shape for i in tensors])
         tensors = [ensure_data_format(t, InterleavedImageBatch) for t in tensors]
         
         if all(t.data_format is InterleavedImageBatch for t in tensors):
@@ -259,7 +260,7 @@ class TfKerasOperations(Operations):
             out = tf.concat(tensors, axis)
             out.data_format = OnnxTensor
         else:
-            # print(">>> concat: ", [[t.shape, t.data_format] for t in tensors])
+            print(">>> concat: ", [[t.shape, t.data_format] for t in tensors])
             raise NotImplementedError
 
         # print(">>> concat: ", [i.shape for i in tensors], out.shape)
@@ -298,10 +299,10 @@ class TfKerasOperations(Operations):
                 padding = 'same'
                 # output_padding = None  # output_padding overrides the padding argument in keras
             else:
-                # print(">>> convtranspose: ", x.shape)
-                # print(">>> convtranspose: ", pads, output_padding)
-                # print(">>> convtranspose: ", h_out, strides[0] * h_in)
-                # print(">>> convtranspose: ", w_out, strides[1] * w_in)
+                print(">>> convtranspose: ", x.shape)
+                print(">>> convtranspose: ", pads, output_padding)
+                print(">>> convtranspose: ", h_out, strides[0] * h_in)
+                print(">>> convtranspose: ", w_out, strides[1] * w_in)
                 raise NotImplementedError
             # Tf; filter_height, filter_width, out_channels, in_channels
             # Torch: (in_channels, out_channels, kH, kW)
@@ -407,11 +408,33 @@ class TfKerasOperations(Operations):
         # out = self.keras.layers.Add()([x1, x2])
         out.data_format = x1.data_format
         return [out]
+    
+    def op_expand(self, x1, x2):
+        # print(">>> expand: ", [i for i in x2])
+        x1_shape = x1.shape
+        expand_shape = [1] * len(x1_shape)
+        for i, (s, x1_s) in enumerate(zip(x2, x1_shape)):
+            if s != x1_s:
+                expand_shape[i] = s
+        out = tf.tile(x1, expand_shape)
+        out.data_format = x1.data_format
+        return [out]
 
     def op_sub(self, x1, x2):
-        x1, x2 = ensure_compatible_data_format(x1, x2)
-        out = self.keras.layers.Subtract()([x1, x2])
-        out.data_format = x1.data_format
+        # print(">>> sub: ", x1.data_format, x2.data_format, x1.shape, x2.shape)
+        # x1, x2 = ensure_compatible_data_format(x1, x2)
+        # out = self.keras.layers.Subtract()([x1, x2])
+        # out.data_format = x1.data_format
+        
+        x1_shape = x1.shape
+        x2_shape = x2.shape
+        if len(x2_shape) > len(x1_shape):
+            out = tf.subtract(x2, x1)
+            out.data_format = x2.data_format
+        else:
+            out = tf.subtract(x1, x2)
+            out.data_format = x1.data_format  
+        
         return [out]
 
     def op_reducemean(self, x, axes, keepdims):
@@ -529,7 +552,7 @@ class TfKerasOperations(Operations):
         return [self.make_constant(shape)]
 
     def op_gather(self, x, indices, axis=0):
-        # print(">>> gather: ", x.data_format, x.shape, indices, axis)
+        print(">>> gather: ", x.data_format, x.shape, indices, axis)
         
         if axis == 0:
             return [self.make_constant(x[indices])]
@@ -633,7 +656,7 @@ class TfKerasOperations(Operations):
         elif mode == b'linear' and coordinate_transformation_mode == b'pytorch_half_pixel':
             out = tf.compat.v1.image.resize(x, size, ResizeMethodV1.BILINEAR, align_corners=False)
         else:
-            # print(">>> resize: ", mode, coordinate_transformation_mode)
+            print(">>> resize: ", mode, coordinate_transformation_mode)
             raise NotImplementedError
         out.data_format = InterleavedImageBatch
         return [out]
@@ -728,7 +751,7 @@ def onnx2keras(onnx_model):
         model_inputs.append(tensors[input.name])
 
     for node in onnx_model.graph.node:
-        # print(">>> node print: ", node.name)
+        print(">>> node print: ", node.name)
         inputs = [tensors[i] for i in node.input]
         attrs = {a.name: ops.parse_attr(a) for a in node.attribute}
         
