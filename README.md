@@ -9,12 +9,8 @@ been implemented in keras if it was implemented by hand.
 
 Usage
 -----
-```
-    python3 onnx2keras.py <infile.onnx> [<outfile.h5>]
-```
-
-Run tests
------
-```
-    make
+核心的op转换都在onnx2keras.py文件中，可以详细阅读
+```bash
+# 转换过程可能出现op不支持，需要边实验边补充
+python onnx2keras.py xxx.onnx xxx.h5 
 ```
