@@ -9,13 +9,51 @@ import numpy as np
 from tensorflow.python.ops.image_ops_impl import ResizeMethodV1
 
 
+class TFSplit(tf.keras.layers.Layer):
+    def __init__(self, num_or_size_splits, axis):
+        super(TFSplit, self).__init__()
+        self.num_or_size_splits = num_or_size_splits
+        self.axis = axis
+    def call(self, inputs):
+        return tf.split(inputs, self.num_or_size_splits, self.axis)
+    
+    def get_config(self):
+        config = super().get_config().copy()
+        config.update({
+            'num_or_size_splits': self.num_or_size_splits,
+            'axis': self.axis
+        })
+        return config
+    
+class TFTranspose(tf.keras.layers.Layer):
+    def __init__(self, perm):
+        super(TFTranspose, self).__init__()
+        self.perm = perm
+        
+    def call(self, inputs):
+        return tf.transpose(inputs, self.perm)
+    
+    
+class TFReshape(tf.keras.layers.Layer):
+    pass
+        
+
+
+
+
+
+
 class Operations:
     def make_op(self, op_type, inputs, attrs):
         # print(op_type)
         # print([i.shape for i in inputs])
         # print(attrs)
         # print()
+        # try:
         return getattr(self, 'op_' + op_type.lower())(*inputs, **attrs)
+        # except Exception as e:
+        #     print(">>> ", e, op_type, attrs, [i.shape for i in inputs])
+            
 
 class DataFormat: pass
 class OnnxTensor(DataFormat): pass
@@ -25,9 +63,12 @@ class InterleavedImageBatch(DataFormat): pass
 class OptimizationMissingWarning(Warning): pass
 
 def ensure_data_format(tensor, format):
+    # print("???: ", tensor, type(tensor))
     if issubclass(tensor.data_format, format):
         return tensor
     elif tensor.data_format is OnnxConstant and format is InterleavedImageBatch:
+        if len(tensor.shape) == 0: tensor = tensor.reshape([1,1,1,1])
+        
         assert len(tensor.shape) == 4
         out = tensor.transpose([0, 2, 3, 1])
         out.data_format = InterleavedImageBatch
@@ -42,7 +83,7 @@ def ensure_data_format(tensor, format):
             warnings.warn("Transpose inserted. Please report at https://github.com/AxisCommunications/onnx-to-keras/issues", OptimizationMissingWarning)
         out.data_format = InterleavedImageBatch
         return out
-    elif tensor.data_format is InterleavedImageBatch and format is OnnxTensor:
+    elif tensor.data_format is InterleavedImageBatch and ((format is OnnxTensor) or (format is OnnxConstant)):
         assert len(tensor.shape) == 4
         n, h, w, c = tensor.shape
         if h == w == 1 or c == 1:
@@ -52,7 +93,9 @@ def ensure_data_format(tensor, format):
             warnings.warn("Transpose inserted. Please report at https://github.com/AxisCommunications/onnx-to-keras/issues", OptimizationMissingWarning)
         out.data_format = OnnxTensor
         return out
+    
     else:
+        print(">>> ensure_data_format", tensor.data_format, format, tensor.shape)
         raise NotImplementedError
 
 def compatible_data_format(format1, format2):
@@ -203,15 +246,28 @@ class TfKerasOperations(Operations):
             raise NotImplementedError
 
     def op_concat(self, *tensors, axis):
+        # print(">>> concat: ", [i.shape for i in tensors])
+        tensors = [ensure_data_format(t, InterleavedImageBatch) for t in tensors]
+        
         if all(t.data_format is InterleavedImageBatch for t in tensors):
             axis = (0, 3, 1, 2)[axis]
             out = self.keras.layers.Concatenate(axis)(list(tensors))
             out.data_format = InterleavedImageBatch
         elif all(t.data_format is OnnxConstant for t in tensors):
             out = self.make_constant(np.concatenate(tensors, axis))
+        elif all(t.data_format is OnnxTensor for t in tensors):
+            out = tf.concat(tensors, axis)
+            out.data_format = OnnxTensor
         else:
+            # print(">>> concat: ", [[t.shape, t.data_format] for t in tensors])
             raise NotImplementedError
+
+        # print(">>> concat: ", [i.shape for i in tensors], out.shape)
+        
         return [out]
+    
+    
+    
 
     def op_convtranspose(self, x, weights, bias=None, kernel_shape=None, strides=None, pads=None, dilations=None,
                          group=None, output_padding=(0, 0)):
@@ -238,10 +294,14 @@ class TfKerasOperations(Operations):
 
             if pads == (0,0,0,0):
                 padding = 'valid'
-            elif h_out == strides[0] * h_in and w_out == strides[1] * w_in and output_padding==(0,0):
+            elif h_out == strides[0] * h_in and w_out == strides[1] * w_in:# and output_padding==(0,0):
                 padding = 'same'
-                output_padding = None  # output_padding overrides the padding argument in keras
+                # output_padding = None  # output_padding overrides the padding argument in keras
             else:
+                # print(">>> convtranspose: ", x.shape)
+                # print(">>> convtranspose: ", pads, output_padding)
+                # print(">>> convtranspose: ", h_out, strides[0] * h_in)
+                # print(">>> convtranspose: ", w_out, strides[1] * w_in)
                 raise NotImplementedError
             # Tf; filter_height, filter_width, out_channels, in_channels
             # Torch: (in_channels, out_channels, kH, kW)
@@ -300,6 +360,24 @@ class TfKerasOperations(Operations):
         out = norm(x)
         out.data_format = x.data_format
         return [out]
+    
+    def op_reducemax(self, x, **kwargs):
+        x = ensure_data_format(x, OnnxTensor)
+        x = tf.reduce_max(x, kwargs['axes'], keepdims=kwargs['keepdims'])
+        x.data_format = OnnxTensor
+        return [x]
+    
+    def op_reducesum(self, x, **kwargs):
+        x = ensure_data_format(x, OnnxTensor)
+        out = tf.reduce_sum(x, kwargs['axes'], keepdims=kwargs['keepdims'])
+        out.data_format = OnnxTensor
+        return [out] 
+        
+    def op_exp(self, x, **kwargs):
+        out = tf.exp(x)
+        out.data_format = x.data_format
+        return [out]
+    
 
     def op_unsqueeze(self, x, axes):
         x = ensure_data_format(x, OnnxTensor)
@@ -323,8 +401,10 @@ class TfKerasOperations(Operations):
         return [out]
 
     def op_add(self, x1, x2):
+        # print(x2.__dict__)
         x1, x2 = ensure_compatible_data_format(x1, x2)
-        out = self.keras.layers.Add()([x1, x2])
+        out = tf.add(x1, x2)
+        # out = self.keras.layers.Add()([x1, x2])
         out.data_format = x1.data_format
         return [out]
 
@@ -449,9 +529,15 @@ class TfKerasOperations(Operations):
         return [self.make_constant(shape)]
 
     def op_gather(self, x, indices, axis=0):
-        x = ensure_data_format(x, OnnxConstant)
+        # print(">>> gather: ", x.data_format, x.shape, indices, axis)
+        
         if axis == 0:
             return [self.make_constant(x[indices])]
+        elif axis == 1:
+            x = ensure_data_format(x, OnnxTensor)
+            out = tf.gather(x, indices, axis=axis)
+            out.data_format = OnnxTensor
+            return [out]
         else:
             raise NotImplementedError
 
@@ -505,9 +591,14 @@ class TfKerasOperations(Operations):
         return [self.make_constant(np.floor(x))]
 
     def op_div(self, a, b):
-        a = ensure_data_format(a, OnnxConstant)
-        b = ensure_data_format(b, OnnxConstant)
-        return [self.make_constant(a / b)]
+        a, b = ensure_compatible_data_format(a, b)
+        # print(">>> div: ", a.shape, a.data_format, b.shape, b.data_format)
+        out = tf.divide(a, b)
+        out.data_format = a.data_format
+        return [out]
+        # a = ensure_data_format(a, OnnxConstant)
+        # b = ensure_data_format(b, OnnxConstant)
+        # return [self.make_constant(a / b)]
 
     def op_upsample(self, x, scales, mode=b'nearest'):
         if mode == b'nearest':
@@ -534,10 +625,15 @@ class TfKerasOperations(Operations):
             size = sizes[2:4]
 
         if mode == b'nearest' and coordinate_transformation_mode == b'asymmetric' and nearest_mode==b'floor':
+            # out = self.keras.layers.UpSampling2D([int(scales[2]), int(scales[3])], interpolation='nearest')(x)
             out = tf.compat.v1.image.resize(x, size, ResizeMethodV1.NEAREST_NEIGHBOR)
         elif mode == b'linear' and coordinate_transformation_mode == b'align_corners':
+            # out = self.keras.layers.UpSampling2D([int(scales[2]), int(scales[3])], interpolation='bilinear')(x)
             out = tf.compat.v1.image.resize(x, size, ResizeMethodV1.BILINEAR, align_corners=True)
+        elif mode == b'linear' and coordinate_transformation_mode == b'pytorch_half_pixel':
+            out = tf.compat.v1.image.resize(x, size, ResizeMethodV1.BILINEAR, align_corners=False)
         else:
+            # print(">>> resize: ", mode, coordinate_transformation_mode)
             raise NotImplementedError
         out.data_format = InterleavedImageBatch
         return [out]
@@ -554,11 +650,19 @@ class TfKerasOperations(Operations):
         out = self.keras.layers.Reshape(shape[1:])(x)
         out.data_format = OnnxTensor
         return [out]
+    
+    def op_split(self, x, axis, split):
+        x = ensure_data_format(x, OnnxTensor)
+        outs = tf.split(x, split, axis=axis)
+        for i, _ in enumerate(outs):
+            outs[i].data_format = OnnxTensor
+        return outs
+        
 
     def op_transpose(self, x, perm):
-        x = ensure_data_format(x, OnnxConstant)
-        x = x.transpose(perm)
-        x.data_format = OnnxConstant
+        x = ensure_data_format(x, OnnxTensor)
+        x = tf.transpose(x, perm)
+        x.data_format = OnnxTensor
         return [x]
 
     def op_matmul(self, x1, x2):
@@ -586,6 +690,8 @@ class TfKerasOperations(Operations):
             raise NotImplementedError
         out.data_format = OnnxTensor
         return [out]
+    
+        
 
     def op_sqrt(self, x):
         out = self.keras.backend.sqrt(x)
@@ -622,8 +728,10 @@ def onnx2keras(onnx_model):
         model_inputs.append(tensors[input.name])
 
     for node in onnx_model.graph.node:
+        # print(">>> node print: ", node.name)
         inputs = [tensors[i] for i in node.input]
         attrs = {a.name: ops.parse_attr(a) for a in node.attribute}
+        
         output_tensors = ops.make_op(node.op_type, inputs, attrs)
         assert len(output_tensors) == len(node.output)
         for n, t in zip(node.output, output_tensors):
@@ -636,7 +744,21 @@ def main(infile, outfile=None, export_saved_model=False):
     if outfile is None:
         outfile = infile[:-5] if infile[-5:] == '.onnx' else infile
         outfile += '.h5'
-    model = onnx2keras(onnx.load(infile))
+    onnx_model = onnx.load(infile)
+        
+        
+        
+    
+    graph = onnx_model.graph
+    node  = graph.node
+    # for i in range(len(node)):
+    #     print(node[i])
+    
+    
+    
+    
+    
+    model = onnx2keras(onnx_model)
     if export_saved_model:
         import tensorflow.compat.v1 as tf_v1
         tf_v1.keras.experimental.export_saved_model(model, export_saved_model)
