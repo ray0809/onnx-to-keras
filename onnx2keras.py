@@ -9,37 +9,71 @@ import numpy as np
 from tensorflow.python.ops.image_ops_impl import ResizeMethodV1
 
 
-class TFSplit(tf.keras.layers.Layer):
-    def __init__(self, num_or_size_splits, axis):
-        super(TFSplit, self).__init__()
-        self.num_or_size_splits = num_or_size_splits
-        self.axis = axis
-    def call(self, inputs):
-        return tf.split(inputs, self.num_or_size_splits, self.axis)
+class GroupConv(tf.keras.Model):
+    def __init__(self, filters, kernel_size, strides, dilation_rate, padding,
+                              kernel_initializer, use_bias, bias_initializer, groups):
+        super().__init__()
+        assert(filters % groups == 0)
+        per_filters = filters // groups
+        for i in range(groups):
+            setattr(self, 'conv{}'.format(i),
+                tf.keras.layers.Conv2D(per_filters, kernel_size, strides,
+                                 dilation_rate=dilation_rate, padding=padding,
+                                 kernel_initializer='zeros', use_bias=use_bias, groups=1) 
+            )
+        self.groups = groups
+        self.filters = filters
+        self.kernel_size = kernel_size
+        self.strides = strides
+        self.dilation_rate = dilation_rate
+        self.padding = padding
+        self.kernel_initializer = kernel_initializer
+        self.use_bias = use_bias
+        self.bias_initializer = bias_initializer
+        
+        
+        
+    def call(self, inp):
+        inps = tf.split(inp, self.groups, axis=3)
+        
+        outs = []
+        for i in range(self.groups):
+            outs.append(getattr(self, 'conv{}'.format(i))(inps[i]))
+
+        outs = tf.concat(outs, axis=3)
+        
+        return outs
     
+    def set_weights(self, weights):
+        ws, bs = None, None
+        ws = np.split(weights[0], self.groups, axis=-1)
+        if len(weights) ==2:
+            bs = np.split(weights[1], self.groups, axis=-1)
+        
+        for i in range(self.groups):
+            if bs is not None:
+                getattr(self, 'conv{}'.format(i)).set_weights([ws[i], bs[i]])
+            else:
+                getattr(self, 'conv{}'.format(i)).set_weights([ws[i]])
+        # return super().set_weights(weights)
+
     def get_config(self):
-        config = super().get_config().copy()
-        config.update({
-            'num_or_size_splits': self.num_or_size_splits,
-            'axis': self.axis
-        })
+        config = {
+            'groups': self.groups,
+            'filters': self.filters,
+            'kernel_size': self.kernel_size,
+            'strides': self.strides,
+            'dilation_rate': self.dilation_rate,
+            'padding': self.padding,
+            'kernel_initializer': self.kernel_initializer,
+            'bias_initializer': self.bias_initializer,
+            'use_bias': self.use_bias
+        }
         return config
-    
-class TFTranspose(tf.keras.layers.Layer):
-    def __init__(self, perm):
-        super(TFTranspose, self).__init__()
-        self.perm = perm
-        
-    def call(self, inputs):
-        return tf.transpose(inputs, self.perm)
-    
-    
-class TFReshape(tf.keras.layers.Layer):
-    pass
-        
 
-
-
+    @classmethod
+    def from_config(cls, config):
+        return cls(**config)
 
 
 
@@ -146,7 +180,7 @@ class TfKerasOperations(Operations):
         if len(kernel_shape) == 2:
             x = ensure_data_format(x, InterleavedImageBatch)
             assert kernel_shape == weights.shape[2:4]
-            if group != x.shape[3]:
+            if group == 1:
                 # Tf; filter_height, filter_width, in_channels, out_channels
                 weights = weights.transpose(2, 3, 1, 0)
                 filters = weights.shape[3]
@@ -162,7 +196,11 @@ class TfKerasOperations(Operations):
                                                              bias_initializer=bias_initializer,
                                                              depthwise_initializer=kernel_initializer)
             else:
-                raise NotImplementedError
+                # Tf; filter_height, filter_width, in_channels, out_channels
+                weights = weights.transpose(2, 3, 1, 0)
+                filters = weights.shape[3]
+                ConvClass = GroupConv 
+                # raise NotImplementedError
             if pads == (0,0,0,0):
                 padding = 'valid'
             elif (kernel_shape[0] == kernel_shape[1] and pads[0] == pads[1] == pads[2] == pads[3] and
@@ -176,11 +214,15 @@ class TfKerasOperations(Operations):
                 pad = self.keras.layers.ZeroPadding2D(((pads[0], pads[2]), (pads[1], pads[3])))
                 x = pad(x)
                 padding = 'valid'
+                
+            if(group > 1 and group != x.shape[3]):
+                print(">>> op_conv: ", weights.shape, weights[:,:,0,0].shape)
 
             if bias is None:
                 conv = ConvClass(filters, kernel_shape, strides,
                                  dilation_rate=dilations, padding=padding,
-                                 kernel_initializer='zeros', use_bias=False, groups=group)
+                                 kernel_initializer='zeros', bias_initializer='zeros',
+                                 use_bias=False, groups=group, )
                 out = conv(x)
                 conv.set_weights([weights.view(np.ndarray)])
             else:
@@ -247,7 +289,7 @@ class TfKerasOperations(Operations):
             raise NotImplementedError
 
     def op_concat(self, *tensors, axis):
-        print(">>> concat: ", [i.shape for i in tensors])
+        print(">>> concat: ", [[i.shape, i.data_format] for i in tensors])
         tensors = [ensure_data_format(t, InterleavedImageBatch) for t in tensors]
         
         if all(t.data_format is InterleavedImageBatch for t in tensors):
@@ -364,15 +406,31 @@ class TfKerasOperations(Operations):
     
     def op_reducemax(self, x, **kwargs):
         x = ensure_data_format(x, OnnxTensor)
-        x = tf.reduce_max(x, kwargs['axes'], keepdims=kwargs['keepdims'])
+        keepdims = kwargs.get('keepdims', None)
+        if keepdims is None: keepdims = False
+        # x = tf.reduce_max(x, kwargs['axes'], keepdims=keepdims)
+        x = self.keras.backend.max(x, kwargs['axes'], keepdims=keepdims)
         x.data_format = OnnxTensor
         return [x]
     
     def op_reducesum(self, x, **kwargs):
         x = ensure_data_format(x, OnnxTensor)
-        out = tf.reduce_sum(x, kwargs['axes'], keepdims=kwargs['keepdims'])
+        keepdims = kwargs.get('keepdims', None)
+        if keepdims is None: keepdims = False
+        out = self.keras.backend.sum(x, axis=kwargs['axes'], keepdims=keepdims)
+        # out = tf.reduce_sum(x, kwargs['axes'], keepdims=keepdims)
         out.data_format = OnnxTensor
         return [out] 
+    
+    def op_reducemean(self, x, axes, keepdims):
+        x = ensure_data_format(x, InterleavedImageBatch)
+        if axes == (2, 3) and keepdims == 0:
+            out = self.keras.layers.GlobalAveragePooling2D()(x)
+            out.data_format = OnnxTensor
+        else:
+            raise NotImplementedError
+
+        return [out]
         
     def op_exp(self, x, **kwargs):
         out = tf.exp(x)
@@ -437,15 +495,7 @@ class TfKerasOperations(Operations):
         
         return [out]
 
-    def op_reducemean(self, x, axes, keepdims):
-        x = ensure_data_format(x, InterleavedImageBatch)
-        if axes == (2, 3) and keepdims == 0:
-            out = self.keras.layers.GlobalAveragePooling2D()(x)
-            out.data_format = OnnxTensor
-        else:
-            raise NotImplementedError
-
-        return [out]
+    
 
     def op_gemm(self, x, weights, bias, beta, transB, alpha):
         x = ensure_data_format(x, OnnxTensor)
